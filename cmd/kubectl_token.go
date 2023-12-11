@@ -23,6 +23,7 @@ import (
 	"github.com/rancher/cli/config"
 	"github.com/rancher/norman/types/convert"
 	managementClient "github.com/rancher/rancher/pkg/client/generated/management/v3"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -63,6 +64,10 @@ var samlProviders = map[string]bool{
 	"shibbolethProvider": true,
 }
 
+var oauthProviders = map[string]bool{
+	"azureADProvider": true,
+}
+
 var supportedAuthProviders = map[string]bool{
 	"localProvider":           true,
 	"freeIpaProvider":         true,
@@ -75,6 +80,9 @@ var supportedAuthProviders = map[string]bool{
 	"keyCloakProvider":   true,
 	"oktaProvider":       true,
 	"shibbolethProvider": true,
+
+	// AzureAD
+	"azureADProvider": true,
 }
 
 func CredentialCommand() cli.Command {
@@ -303,6 +311,11 @@ func loginAndGenerateCred(input *LoginInput) (*config.ExecCredential, error) {
 		if err != nil {
 			return nil, err
 		}
+	} else if oauthProviders[input.authProvider] {
+		token, err = oauthAuth(input, tlsConfig)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		customPrint(fmt.Sprintf("Enter credentials for %s \n", input.authProvider))
 		token, err = basicAuth(input, tlsConfig)
@@ -329,6 +342,126 @@ func loginAndGenerateCred(input *LoginInput) (*config.ExecCredential, error) {
 	cred.Status.ExpirationTimestamp = &config.Time{Time: ts}
 	return cred, nil
 
+}
+
+func oauthAuth(input *LoginInput, tlsConfig *tls.Config) (managementClient.Token, error) {
+	token := managementClient.Token{}
+	providerData, _ := getAuthProvidersWithInfo(input.server)
+	redirectURL := ""
+	for _, value := range convert.ToMapSlice(providerData["data"]) {
+		provider := convert.ToString(value["type"])
+		if provider != "" && provider == "azureADProvider" {
+			redirectURL = convert.ToString(value["redirectUrl"])
+		}
+	}
+	logrus.Infof("RedirectURL is: %s", redirectURL)
+	jwtValue, _ := createState("dMWRKirwYLYqwhAD", "vue", "azuread")
+	redirectURL = fmt.Sprintf("%s&state=%s", redirectURL, jwtValue)
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return token, err
+	}
+
+	id, err := generateKey()
+	if err != nil {
+		return token, err
+	}
+
+	responseType := "kubeconfig"
+	if input.clusterID != "" {
+		responseType = fmt.Sprintf("%s_%s", responseType, input.clusterID)
+	}
+
+	tokenURL := fmt.Sprintf(authTokenURL, input.server, id)
+
+	req, err := http.NewRequest(http.MethodGet, tokenURL, bytes.NewBuffer(nil))
+	if err != nil {
+		return token, err
+	}
+
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("accept", "application/json")
+
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	client := &http.Client{Transport: tr, Timeout: 300 * time.Second}
+
+	//loginRequest := fmt.Sprintf("%s/dashboard/auth/login?requestId=%s&publicKey=%s&responseType=%s",
+	//	input.server, id, encodedKey, responseType)
+
+	customPrint(fmt.Sprintf("\nLogin to AzureAD Server at %s \n", redirectURL))
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	// timeout for user to login and get token
+	timeout := time.NewTicker(15 * time.Minute)
+	defer timeout.Stop()
+
+	poll := time.NewTicker(10 * time.Second)
+	defer poll.Stop()
+
+	for {
+		select {
+		case <-poll.C:
+			res, err := client.Do(req)
+			if err != nil {
+				return token, err
+			}
+			content, err := ioutil.ReadAll(res.Body)
+			if err != nil {
+				res.Body.Close()
+				return token, err
+			}
+			res.Body.Close()
+			err = json.Unmarshal(content, &token)
+			if err != nil {
+				return token, err
+			}
+			if token.Token == "" {
+				continue
+			}
+			decoded, err := base64.StdEncoding.DecodeString(token.Token)
+			if err != nil {
+				return token, err
+			}
+			decryptedBytes, err := privateKey.Decrypt(nil, decoded, &rsa.OAEPOptions{Hash: crypto.SHA256})
+			if err != nil {
+				panic(err)
+			}
+			token.Token = string(decryptedBytes)
+
+			// delete token
+			req, err = http.NewRequest(http.MethodDelete, tokenURL, bytes.NewBuffer(nil))
+			if err != nil {
+				return token, err
+			}
+			req.Header.Set("content-type", "application/json")
+			req.Header.Set("accept", "application/json")
+			tr := &http.Transport{
+				TLSClientConfig: tlsConfig,
+			}
+			client = &http.Client{Transport: tr, Timeout: 150 * time.Second}
+			res, err = client.Do(req)
+			if err != nil {
+				// log error and use the token if login succeeds
+				customPrint(fmt.Errorf("DeleteToken: %v", err))
+			}
+			return token, nil
+
+		case <-timeout.C:
+			break
+
+		case <-interrupt:
+			customPrint("received interrupt")
+			break
+		}
+
+		return token, nil
+	}
 }
 
 func basicAuth(input *LoginInput, tlsConfig *tls.Config) (managementClient.Token, error) {
@@ -511,6 +644,18 @@ func getAuthProviders(server string) (map[string]string, error) {
 	return providers, err
 }
 
+func getAuthProvidersWithInfo(server string) (map[string]interface{}, error) {
+	authProviders := fmt.Sprintf(authProviderURL, server)
+	customPrint(authProviders)
+	response, err := request(http.MethodGet, authProviders, nil)
+	data := map[string]interface{}{}
+	err = json.Unmarshal(response, &data)
+	if err != nil {
+		return nil, err
+	}
+	return data, err
+}
+
 func getAuthProvider(server string) (string, error) {
 	authProviders, err := getAuthProviders(server)
 	if err != nil || authProviders == nil {
@@ -626,4 +771,21 @@ func customPrompt(field string, show bool) (result string, err error) {
 
 func customPrint(data interface{}) {
 	fmt.Fprintf(os.Stderr, "%v \n", data)
+}
+
+func createState(nonce, to, provider string) (string, error) {
+	state := map[string]string{
+		"nonce":    nonce,
+		"provider": provider,
+		"to":       to,
+	}
+	jsonBytes, err := json.Marshal(state)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert the byte slice to a string
+	jsonString := base64.StdEncoding.EncodeToString(jsonBytes)
+
+	return jsonString, nil
 }
